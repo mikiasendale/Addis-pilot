@@ -1,0 +1,7 @@
+{
+  "name": "Addis Pilot: The AI Tutor",
+  "description": "An offline-first educational platform merging PDF interaction with 3D AI avatars for Ethiopian students.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
