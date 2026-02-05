@@ -17,17 +17,17 @@ export const PDFReader: React.FC<PDFReaderProps> = ({ onExplain, onQuiz, file })
   
   // Resizing state
   const containerRef = useRef<HTMLDivElement>(null);
-  const [containerWidth, setContainerWidth] = useState<number>(600);
+  const [pageWidth, setPageWidth] = useState<number>(600);
 
   // Resize Observer for auto-fitting PDF
   useEffect(() => {
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (entry) {
-        // We use Math.floor to avoid sub-pixel rendering issues.
-        // contentRect.width is already the width INSIDE the padding of the parent.
-        // We subtract 2px just to ensure we never trigger a horizontal scrollbar due to rounding.
-        setContainerWidth(Math.floor(entry.contentRect.width) - 2);
+        // Calculate width: Container width minus padding (e.g., 64px for p-8)
+        // We leave some breathing room so it looks like paper on a desk
+        const newWidth = Math.floor(entry.contentRect.width) - 48;
+        setPageWidth(newWidth > 0 ? newWidth : 600);
       }
     });
 
@@ -64,7 +64,6 @@ export const PDFReader: React.FC<PDFReaderProps> = ({ onExplain, onQuiz, file })
     window.getSelection()?.removeAllRanges();
   };
 
-  // When on the last page, we can assume it's "Chapter Complete"
   const isLastPage = pageNumber === numPages && numPages > 0;
 
   return (
@@ -94,38 +93,40 @@ export const PDFReader: React.FC<PDFReaderProps> = ({ onExplain, onQuiz, file })
        {/* PDF Viewport */}
        <div 
          ref={containerRef}
-         className="flex-1 overflow-auto p-4 flex justify-center bg-slate-200 relative" 
+         className="flex-1 overflow-auto bg-slate-200/50 relative flex flex-col items-center py-6" 
          onMouseUp={handleMouseUp}
        >
           {file ? (
-            <div className="relative shadow-lg">
+            <div className="relative shadow-xl flex flex-col gap-6 items-center">
                <Document file={file} onLoadSuccess={onDocumentLoadSuccess}>
                 <Page 
                   pageNumber={pageNumber} 
                   renderTextLayer={true} 
                   renderAnnotationLayer={false}
-                  width={containerWidth} // Matches container perfectly
-                  className="bg-white"
+                  width={pageWidth} 
+                  className="bg-white border border-slate-300"
                 />
               </Document>
               
-              {/* LAST PAGE OVERLAY - QUIZ PROMPT */}
+              {/* QUIZ SECTION (Appears below the last page) */}
               {isLastPage && (
-                <div className="absolute inset-0 z-50 bg-slate-900/90 backdrop-blur-sm flex flex-col items-center justify-center text-white animate-in fade-in duration-500">
-                    <div className="bg-indigo-600 p-4 rounded-full mb-4 shadow-lg shadow-indigo-500/50 animate-bounce">
-                      <Trophy size={48} className="text-yellow-300" />
+                <div className="w-full max-w-2xl mt-4 animate-in slide-in-from-bottom-4 duration-700 fade-in">
+                    <div className="bg-slate-900 text-white rounded-2xl p-6 shadow-2xl border border-indigo-500/30 flex flex-col items-center text-center">
+                        <div className="bg-indigo-600 p-3 rounded-full mb-4 shadow-lg shadow-indigo-500/50">
+                          <Trophy size={32} className="text-yellow-300" />
+                        </div>
+                        <h2 className="text-2xl font-bold mb-2">Chapter Complete!</h2>
+                        <p className="text-slate-300 mb-6 text-sm">
+                          You've finished this section. Verify your mastery before moving on.
+                        </p>
+                        <button 
+                          onClick={() => onQuiz("Generate a summary quiz for the entire chapter I just read.")}
+                          className="w-full py-4 bg-white text-indigo-700 rounded-xl font-bold text-lg hover:bg-indigo-50 transition-colors shadow-lg flex items-center justify-center gap-2"
+                        >
+                          <BrainCircuit size={20} />
+                          Take Chapter Quiz
+                        </button>
                     </div>
-                    <h2 className="text-3xl font-bold mb-2">Chapter Complete!</h2>
-                    <p className="text-slate-300 mb-8 max-w-md text-center">
-                      Great job finishing this section. Let's see how much you've mastered.
-                    </p>
-                    <button 
-                      onClick={() => onQuiz("Generate a summary quiz for the entire chapter I just read.")}
-                      className="px-8 py-4 bg-white text-indigo-700 rounded-xl font-bold text-lg hover:scale-105 transition-transform shadow-xl flex items-center gap-2"
-                    >
-                      <BrainCircuit size={24} />
-                      Start Chapter Quiz
-                    </button>
                 </div>
               )}
             </div>
@@ -136,7 +137,7 @@ export const PDFReader: React.FC<PDFReaderProps> = ({ onExplain, onQuiz, file })
             </div>
           )}
 
-          {/* Context Menu Popup */}
+          {/* Context Menu Popup (Floating) */}
           {selection && (
             <div 
               style={{ position: 'fixed', left: selection.x, top: selection.y }}
