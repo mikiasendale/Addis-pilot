@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { PDFReader } from './components/PDFReader';
 import { Avatar } from './components/Avatar';
 import { Dashboard } from './components/Dashboard';
@@ -8,20 +9,22 @@ import { TRANSLATIONS } from './translations';
 import { 
   Play, Mic, FileText, Upload, School, AlertCircle, 
   BookOpen, Calculator, Atom, Dna, Globe, ChevronLeft, Layers, Languages, Check, X,
-  Brain, Send, Sparkles
+  Brain, Send, Sparkles, StopCircle, Loader2, WifiOff
 } from 'lucide-react';
 
 // --- INTEGRATION GUIDE ---
 // 1. Place your PDF files in the 'public' folder.
-// 2. Update the URLs below. Example: pdfUrl: "/textbooks/grade11_physics.pdf"
+// 2. Update the URLs below.
 const SAMPLE_PDF_URL = "https://raw.githubusercontent.com/mozilla/pdf.js/ba2edeae/web/compressed.tracemonkey-pldi-09.pdf"; 
+// Updated to use the raw GitHub content URL which supports CORS directly
+const PHY_11_URL = "https://raw.githubusercontent.com/mikiasendale/books/main/grade%2011-physics_fetena_net_e906.pdf";
 
 const CURRICULUM: GradeLevel[] = [
   {
     id: '11',
     labelKey: 'grade_11',
     subjects: [
-      { id: 'phy11', nameKey: 'physics', iconName: 'Atom', pdfUrl: SAMPLE_PDF_URL },
+      { id: 'phy11', nameKey: 'physics', iconName: 'Atom', pdfUrl: PHY_11_URL, startPage: 7 },
       { id: 'math11', nameKey: 'math', iconName: 'Calculator', pdfUrl: SAMPLE_PDF_URL },
       { id: 'bio11', nameKey: 'biology', iconName: 'Dna', pdfUrl: SAMPLE_PDF_URL },
       { id: 'chem11', nameKey: 'chemistry', iconName: 'FlaskConical', pdfUrl: SAMPLE_PDF_URL },
@@ -50,28 +53,71 @@ const IconMap: Record<string, React.FC<any>> = {
   FlaskConical: Layers 
 };
 
+// Enhanced Fetcher with Multi-Proxy Fallback
 const fetchPdfWithCache = async (url: string): Promise<Blob> => {
-  if (!('caches' in window)) {
-    const response = await fetch(url);
-    return response.blob();
-  }
   const CACHE_NAME = 'addis-pilot-textbooks-v1';
-  try {
-    const cache = await caches.open(CACHE_NAME);
-    const cachedResponse = await cache.match(url);
-    if (cachedResponse) {
-      console.log(`[Cache Hit] Loading ${url} from local storage.`);
-      return cachedResponse.blob();
+
+  // 1. Try Cache
+  if ('caches' in window) {
+    try {
+      const cache = await caches.open(CACHE_NAME);
+      const cachedResponse = await cache.match(url);
+      if (cachedResponse) {
+        console.log(`[Cache Hit] Loading ${url} from local storage.`);
+        return cachedResponse.blob();
+      }
+    } catch (e) {
+      console.warn("Cache lookup failed", e);
     }
-    console.log(`[Network Fetch] Downloading ${url}...`);
-    const networkResponse = await fetch(url);
-    if (!networkResponse.ok) throw new Error("Network error");
-    cache.put(url, networkResponse.clone());
-    return networkResponse.blob();
-  } catch (error) {
-    console.error("Caching failed:", error);
-    const response = await fetch(url);
-    return response.blob();
+  }
+
+  // Helper to fetch and cache
+  const fetchAndCache = async (fetchUrl: string, cacheKey: string) => {
+    const response = await fetch(fetchUrl);
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    
+    const blob = await response.blob();
+    
+    // Basic validation: if blob is tiny (e.g. error text), reject
+    if (blob.size < 5000) {
+       throw new Error("Downloaded file is too small, likely an error page.");
+    }
+
+    if ('caches' in window) {
+      try {
+        const cache = await caches.open(CACHE_NAME);
+        cache.put(cacheKey, new Response(blob));
+      } catch (e) { console.warn("Cache put failed", e); }
+    }
+    return blob;
+  };
+
+  // Strategy: Direct -> AllOrigins -> CorsProxy -> Fail
+  try {
+    console.log(`[Network] Attempting direct fetch: ${url}`);
+    return await fetchAndCache(url, url);
+  } catch (directError) {
+    console.warn("Direct fetch failed. Initiating proxy fallback sequence...", directError);
+    
+    // Optimized list of proxies
+    const proxies = [
+      // AllOrigins Raw is usually the most permissive for images/PDFs
+      (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+      // CORS Proxy IO
+      (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`
+    ];
+
+    for (const proxyGen of proxies) {
+      try {
+        const proxyUrl = proxyGen(url);
+        console.log(`[Proxy] Trying: ${proxyUrl}`);
+        return await fetchAndCache(proxyUrl, url);
+      } catch (proxyError) {
+        console.warn(`Proxy attempt failed for ${proxyGen(url)}:`, proxyError);
+      }
+    }
+    
+    throw new Error("All network and proxy attempts failed.");
   }
 };
 
@@ -85,10 +131,16 @@ function App() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isLoadingPdf, setIsLoadingPdf] = useState(false);
+  const [isFallbackMode, setIsFallbackMode] = useState(false);
   
   // Ask Taytu Input State
   const [inputMessage, setInputMessage] = useState("");
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Voice Recognition State
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<any>(null);
 
   // Quiz State
   const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[]>([]);
@@ -117,36 +169,76 @@ function App() {
     return () => { ctx.close(); }
   }, []);
 
-  // FIXED: Manual PCM Decoding for Gemini 2.5 TTS
-  // NOTE: Browser's decodeAudioData fails on raw PCM. We must construct AudioBuffer manually.
+  // Initialize Speech Recognition
+  useEffect(() => {
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = 'en-US'; // Default to English, can switch based on language prop
+
+        recognition.onstart = () => setIsListening(true);
+        
+        recognition.onresult = (event: any) => {
+            const transcript = event.results[0][0].transcript;
+            setInputMessage(transcript);
+            setIsListening(false);
+            // Auto-send after a brief pause for a conversational feel
+            setTimeout(() => {
+               sendMessage(transcript);
+            }, 500);
+        };
+
+        recognition.onerror = (event: any) => {
+            console.error("Speech Recognition Error", event);
+            setIsListening(false);
+        };
+
+        recognition.onend = () => setIsListening(false);
+        
+        recognitionRef.current = recognition;
+    }
+  }, [language]);
+
+  const toggleListening = () => {
+    if (!recognitionRef.current) {
+      alert("Speech recognition is not supported in this browser.");
+      return;
+    }
+
+    if (isListening) {
+      recognitionRef.current.stop();
+    } else {
+      // Update language before starting
+      let langCode = 'en-US';
+      if (language === 'AMHARIC') langCode = 'am-ET'; // Basic support if available
+      // Oromo not standard in Web Speech API yet, fallback to English
+      recognitionRef.current.lang = langCode;
+      recognitionRef.current.start();
+    }
+  };
+
   const playAudio = async (base64String: string) => {
     const ctx = audioContextRef.current;
     const analyser = analyserRef.current;
     if (!ctx || !analyser) return;
 
     try {
-      // 1. Convert Base64 to Binary String
       const binaryString = atob(base64String);
       const len = binaryString.length;
-      
-      // 2. Create Uint8Array from binary string
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
           bytes[i] = binaryString.charCodeAt(i);
       }
 
-      // 3. Create Int16Array (Raw PCM data is 16-bit signed integer)
-      // Ensure byte length is even
       const bufferLen = bytes.length % 2 === 0 ? bytes.length : bytes.length - 1;
       const int16Data = new Int16Array(bytes.buffer, 0, bufferLen / 2);
 
-      // 4. Create AudioBuffer (Mono, 24kHz matches Gemini Output)
       const audioBuffer = ctx.createBuffer(1, int16Data.length, 24000);
       const channelData = audioBuffer.getChannelData(0);
 
-      // 5. Convert Int16 to Float32 (-1.0 to 1.0) for Web Audio API
       for (let i = 0; i < int16Data.length; i++) {
-          // Normalization: 32768 is the max amplitude for 16-bit audio
           channelData[i] = int16Data[i] / 32768.0;
       }
 
@@ -163,34 +255,47 @@ function App() {
     }
   };
 
-  const processAIResponse = async (text: string, context: string) => {
+  const processAIResponse = async (text: string, context: string, shouldSpeak: boolean) => {
     if (isProcessing) return;
     setIsProcessing(true);
     try {
       const explanation = await generateExplanation(text, context, language);
       const aiMsg: ChatMessage = { id: Date.now().toString(), role: 'model', text: explanation, timestamp: Date.now() };
       setChatHistory(prev => [...prev, aiMsg]);
-      const audioBase64 = await generateSpeech(explanation);
-      if (audioBase64) await playAudio(audioBase64);
+      
+      if (shouldSpeak) {
+        const audioBase64 = await generateSpeech(explanation);
+        if (audioBase64) await playAudio(audioBase64);
+      }
     } catch (err) { console.error(err); } finally { setIsProcessing(false); }
+  };
+
+  const sendMessage = async (text: string) => {
+    if (!text.trim()) return;
+    
+    const userMsg: ChatMessage = { id: Date.now().toString(), role: 'user', text: text, timestamp: Date.now() };
+    setChatHistory(prev => [...prev, userMsg]);
+    setInputMessage(""); 
+
+    const recentHistory = chatHistory.slice(-4).map(m => `${m.role === 'user' ? 'Student' : 'Taytu'}: ${m.text}`).join('\n');
+    const subjectName = selectedSubject ? t(selectedSubject.nameKey) : 'General Knowledge';
+    
+    await processAIResponse(text, `Subject: ${subjectName}.\n\nRecent Conversation Context:\n${recentHistory}\n\nThe user is asking you directly.`, true);
   };
 
   const handleExplain = async (text: string) => {
     const userMsg: ChatMessage = { id: Date.now().toString(), role: 'user', text: `Explain: "${text.substring(0, 30)}..."`, timestamp: Date.now() };
     setChatHistory(prev => [...prev, userMsg]);
     const subjectName = selectedSubject ? t(selectedSubject.nameKey) : '';
-    await processAIResponse(text, `Subject: ${subjectName}`);
+    await processAIResponse(text, `Subject: ${subjectName}`, false);
   };
 
-  const handleAskTaytu = async () => {
-    const msgText = inputMessage || "Hello Empress Taytu!"; // Default greeting if empty
-    
-    const userMsg: ChatMessage = { id: Date.now().toString(), role: 'user', text: msgText, timestamp: Date.now() };
-    setChatHistory(prev => [...prev, userMsg]);
-    setInputMessage(""); // Clear input
-    
-    const subjectName = selectedSubject ? t(selectedSubject.nameKey) : 'General Knowledge';
-    await processAIResponse(msgText, `Subject: ${subjectName}. The user is asking you directly.`);
+  const handleAskTaytuButton = () => {
+    if (inputMessage.trim()) {
+      sendMessage(inputMessage);
+    } else {
+      toggleListening();
+    }
   };
 
   const handleQuiz = async (text: string) => {
@@ -226,6 +331,8 @@ function App() {
     if (e.target.files && e.target.files[0]) {
       setFile(e.target.files[0]);
       setNavStep('VIEWING');
+      setIsFallbackMode(false);
+      setSelectedSubject(null);
     }
   };
 
@@ -236,14 +343,42 @@ function App() {
 
   const selectSubject = async (subject: Subject) => {
     setSelectedSubject(subject);
+    setIsLoadingPdf(true);
+    setIsFallbackMode(false);
+    
     try {
+      // Attempt main URL
       const blob = await fetchPdfWithCache(subject.pdfUrl);
       const pdfFile = new File([blob], `${t(subject.nameKey)}.pdf`, { type: "application/pdf" });
       setFile(pdfFile);
       setNavStep('VIEWING');
     } catch (e) {
-      console.error("Failed to load PDF", e);
-      alert(t('load_pdf_error'));
+      console.warn(`Primary PDF load failed for ${subject.nameKey}. Switching to fallback.`, e);
+      
+      try {
+        // Fallback to SAMPLE_PDF_URL
+        const fallbackBlob = await fetchPdfWithCache(SAMPLE_PDF_URL);
+        const fallbackFile = new File([fallbackBlob], `${t(subject.nameKey)} (Demo).pdf`, { type: "application/pdf" });
+        setFile(fallbackFile);
+        setIsFallbackMode(true);
+        setNavStep('VIEWING');
+        
+        // Notify user via chat so they know why
+        setTimeout(() => {
+          setChatHistory(prev => [...prev, {
+            id: Date.now().toString(),
+            role: 'model',
+            text: `**Network Notice:** The official Ministry textbook server for ${t(subject.nameKey)} is currently unreachable. \n\nI have loaded the **Offline Demo Textbook** so we can continue our session. All AI features (Quiz, Explanation, Voice) are fully functional!`,
+            timestamp: Date.now()
+          }]);
+        }, 1000);
+        
+      } catch (fallbackError) {
+        console.error("Even fallback failed", fallbackError);
+        alert("Critial Error: Could not load any textbook content. Please check your connection.");
+      }
+    } finally {
+      setIsLoadingPdf(false);
     }
   };
 
@@ -353,28 +488,48 @@ function App() {
 
                 {navStep === 'SUBJECT_SELECT' && selectedGrade && (
                    <div className="h-full flex items-center justify-center p-10">
-                   <div className="grid grid-cols-3 gap-6 w-full max-w-4xl">
-                     {selectedGrade.subjects.map(subject => {
-                       const Icon = IconMap[subject.iconName] || Layers;
-                       return (
-                         <button key={subject.id} onClick={() => selectSubject(subject)} className="aspect-square rounded-2xl bg-slate-800 hover:bg-slate-700 transition-all duration-300 group flex flex-col items-center justify-center border border-slate-700 hover:border-indigo-400 shadow-lg">
-                           <div className="p-4 rounded-full bg-slate-900/50 group-hover:bg-indigo-500/20 mb-4 transition-colors">
-                             <Icon size={32} className="text-indigo-400 group-hover:text-indigo-300" />
-                           </div>
-                           <span className="text-lg font-semibold text-slate-200 group-hover:text-white">{t(subject.nameKey)}</span>
-                           <span className="text-xs text-slate-500 mt-2">{t('ministry_label')}</span>
-                         </button>
-                       )
-                     })}
-                   </div>
+                   {isLoadingPdf ? (
+                     <div className="flex flex-col items-center gap-4 text-indigo-400">
+                       <Loader2 size={48} className="animate-spin" />
+                       <span className="text-lg font-medium">Downloading Textbook (Offline Ready)...</span>
+                     </div>
+                   ) : (
+                     <div className="grid grid-cols-3 gap-6 w-full max-w-4xl">
+                       {selectedGrade.subjects.map(subject => {
+                         const Icon = IconMap[subject.iconName] || Layers;
+                         return (
+                           <button key={subject.id} onClick={() => selectSubject(subject)} className="aspect-square rounded-2xl bg-slate-800 hover:bg-slate-700 transition-all duration-300 group flex flex-col items-center justify-center border border-slate-700 hover:border-indigo-400 shadow-lg">
+                             <div className="p-4 rounded-full bg-slate-900/50 group-hover:bg-indigo-500/20 mb-4 transition-colors">
+                               <Icon size={32} className="text-indigo-400 group-hover:text-indigo-300" />
+                             </div>
+                             <span className="text-lg font-semibold text-slate-200 group-hover:text-white">{t(subject.nameKey)}</span>
+                             <span className="text-xs text-slate-500 mt-2">{t('ministry_label')}</span>
+                           </button>
+                         )
+                       })}
+                     </div>
+                   )}
                  </div>
                 )}
 
                 {navStep === 'VIEWING' && (
                   <div className="h-full flex relative">
+                    {/* Fallback Banner */}
+                    {isFallbackMode && (
+                        <div className="absolute top-0 left-0 right-0 z-20 bg-amber-600/90 text-white text-xs font-bold text-center py-1 flex items-center justify-center gap-2 backdrop-blur-sm">
+                           <WifiOff size={14} />
+                           OFFLINE DEMO MODE: Official server unreachable. Displaying sample content.
+                        </div>
+                    )}
+                  
                     {/* PDF Area */}
                     <div className={`transition-all duration-500 ease-in-out ${quizActive ? 'w-1/2' : 'w-full'}`}>
-                      <PDFReader onExplain={handleExplain} onQuiz={handleQuiz} file={file} />
+                      <PDFReader 
+                         onExplain={handleExplain} 
+                         onQuiz={handleQuiz} 
+                         file={file} 
+                         startPage={selectedSubject?.startPage}
+                      />
                     </div>
                     
                     {/* Quiz Panel Overlay */}
@@ -453,8 +608,8 @@ function App() {
              <Avatar analyser={analyserState} />
              <div className="mt-2 flex justify-between items-center text-xs text-slate-500">
                <span className="flex items-center gap-1">
-                 <Mic size={12} className={isSpeaking ? "text-red-500 animate-pulse" : ""} /> 
-                 STATUS: {isSpeaking ? t('status_speaking') : t('status_listening')}
+                 <Mic size={12} className={isSpeaking || isListening ? "text-red-500 animate-pulse" : ""} /> 
+                 STATUS: {isSpeaking ? t('status_speaking') : isListening ? "LISTENING..." : t('status_listening')}
                </span>
                <span className="font-mono text-indigo-400">GEMINI-2.5-FLASH</span>
              </div>
@@ -462,12 +617,32 @@ function App() {
              {/* ASK TAYTU CONTROL */}
              <div className="mt-4 flex flex-col gap-2">
                 <button 
-                   onClick={handleAskTaytu}
+                   onClick={handleAskTaytuButton}
                    disabled={isProcessing}
-                   className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 disabled:text-indigo-400 text-white rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-indigo-900/20 active:scale-95"
+                   className={`w-full py-3 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg active:scale-95 ${
+                     isListening 
+                      ? 'bg-red-600 hover:bg-red-500 text-white animate-pulse'
+                      : inputMessage.trim() 
+                        ? 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-900/20'
+                        : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-900/20'
+                   } disabled:bg-slate-800 disabled:text-slate-500`}
                 >
-                  <Sparkles size={18} />
-                  {t('ask_taytu_btn')}
+                  {isListening ? (
+                    <>
+                      <StopCircle size={18} />
+                      Stop Listening
+                    </>
+                  ) : inputMessage.trim() ? (
+                    <>
+                      <Send size={18} />
+                      Send Message
+                    </>
+                  ) : (
+                    <>
+                      <Mic size={18} />
+                      {t('ask_taytu_btn')}
+                    </>
+                  )}
                 </button>
              </div>
           </div>
@@ -485,7 +660,9 @@ function App() {
                  <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${
                    msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-slate-800 text-slate-200 rounded-bl-none border border-slate-700'
                  }`}>
-                   {msg.text}
+                   <ReactMarkdown className="prose prose-invert prose-sm max-w-none prose-p:my-1 prose-headings:my-2 prose-strong:text-current">
+                     {msg.text}
+                   </ReactMarkdown>
                  </div>
                </div>
              ))}
@@ -506,13 +683,14 @@ function App() {
                  type="text" 
                  value={inputMessage}
                  onChange={(e) => setInputMessage(e.target.value)}
-                 onKeyDown={(e) => e.key === 'Enter' && handleAskTaytu()}
-                 placeholder={t('chat_placeholder')}
-                 className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500"
+                 onKeyDown={(e) => e.key === 'Enter' && sendMessage(inputMessage)}
+                 placeholder={isListening ? "Listening..." : t('chat_placeholder')}
+                 disabled={isListening}
+                 className={`flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 ${isListening ? 'placeholder-red-400' : ''}`}
                />
                <button 
-                 onClick={handleAskTaytu}
-                 disabled={!inputMessage.trim()}
+                 onClick={() => sendMessage(inputMessage)}
+                 disabled={!inputMessage.trim() || isListening}
                  className="p-2 bg-indigo-600 rounded-lg text-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-indigo-500"
                >
                  <Send size={18} />

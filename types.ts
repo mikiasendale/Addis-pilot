@@ -11,6 +11,7 @@ export interface Subject {
   nameKey: string;
   iconName: string; 
   pdfUrl: string;
+  startPage?: number;
 }
 
 export interface GradeLevel {
